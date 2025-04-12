@@ -178,8 +178,6 @@ async fn draw_video(
 
     let frame_duration = Duration::from_secs_f64(frame_duration);
 
-    let mut instant = Instant::now();
-
     // FIXME: ass workaround
     // let sound = load_sound_from_bytes(&std::fs::read("output.wav")?).await?;
 
@@ -223,9 +221,13 @@ async fn draw_video(
 
     play_sound_once(&sound);
 
+    let mut broken = Duration::new(0, 0);
+
+    let mut instant = Instant::now();
+
     for texture in frames {
-        clear_background(WHITE);
-        draw_texture(&texture, 0., 0., BLACK);
+        clear_background(BLACK);
+        draw_texture(&texture, 0., 0., WHITE);
         draw_text(
             &format!("{:.2}", 1. / get_frame_time()),
             90.,
@@ -237,9 +239,19 @@ async fn draw_video(
         let elapsed = instant.elapsed();
 
         if elapsed < frame_duration {
-            sleep(frame_duration - elapsed);
+            if frame_duration - elapsed >= broken {
+                sleep(frame_duration - elapsed - broken);
+                broken = Duration::new(0, 0);
+            } else {
+                sleep(Duration::new(0, 0));
+                broken = broken.saturating_sub(frame_duration - elapsed);
+            }
         } else {
-            warn!("took tooooo long to render!");
+            broken = elapsed - frame_duration;
+            warn!(
+                "took tooooo long to render!\nwill try to compensate it by early playing the next frame by {:?}",
+                broken
+            );
         }
         instant = Instant::now();
         next_frame().await;
@@ -252,7 +264,7 @@ async fn main() -> eyre::Result<()> {
     ffmpeg::init()?;
 
     request_new_screen_size(800., 450.);
-    let mut input = ffmpeg::format::input("test.mp4")?;
+    let mut input = ffmpeg::format::input("song.webm")?;
     let vstream = input
         .streams()
         .best(media::Type::Video)
