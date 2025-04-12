@@ -254,6 +254,7 @@ version = "0.1.0"
 dependencies = [
  "eyre",
  "ffmpeg-the-third",
+ "hound",
  "macroquad",
 ]
 

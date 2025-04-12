@@ -8,7 +8,7 @@ use eyre::ContextCompat;
 use ffmpeg_the_third::{
     self as ffmpeg, Packet, Stream, codec,
     filter::Graph,
-    format::{Pixel, context::Input},
+    format::{self, Pixel, context::Input},
     frame::{Audio, Video, audio::Sample},
     media,
     software::{resampling, scaling::Flags},
@@ -119,7 +119,22 @@ fn decode_frame<'a>(
             let mut decoded_audio = Audio::empty();
             let mut audio = Vec::new();
             while adecoder.receive_frame(&mut decoded_audio).is_ok() {
-                audio.push(decoded_audio.clone());
+                let mut resampler = ffmpeg::software::resampler2(
+                    (
+                        decoded_audio.format(),
+                        decoded_audio.ch_layout(),
+                        decoded_audio.rate(),
+                    ),
+                    (
+                        format::Sample::I16(format::sample::Type::Packed),
+                        decoded_audio.ch_layout(),
+                        decoded_audio.rate(),
+                    ),
+                )
+                .ok()?;
+                let mut wav = Audio::empty();
+                resampler.run(&decoded_audio, &mut wav).ok()?;
+                audio.push(wav);
             }
             Some(audio)
         })
@@ -159,19 +174,58 @@ async fn draw_video(
     frame_rate: f64,
 ) -> eyre::Result<()> {
     let frame_duration = 1.0 / frame_rate;
+    let mut audio = audio.peekable();
 
     let frame_duration = Duration::from_secs_f64(frame_duration);
 
     let mut instant = Instant::now();
 
     // FIXME: ass workaround
-    let sound = load_sound_from_bytes(&std::fs::read("output.wav")?).await?;
+    // let sound = load_sound_from_bytes(&std::fs::read("output.wav")?).await?;
+
+    // play_sound_once(&sound);
+    //
+    let mut buffer = Vec::new();
+    let cursor = std::io::Cursor::new(&mut buffer);
+
+    let mut writer = hound::WavWriter::new(
+        cursor,
+        hound::WavSpec {
+            channels: audio
+                .peek()
+                .context("empty audio stream")?
+                .ch_layout()
+                .channels()
+                .try_into()?,
+            sample_rate: audio.peek().context("empty audio stream")?.rate(),
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )?;
+    for audio in audio {
+        let channels: u16 = audio.ch_layout().channels().try_into()?;
+        let data = audio.data(0);
+        let sample_size = 2;
+        let frame_size = sample_size * channels;
+
+        for frame in data.chunks_exact(frame_size.into()) {
+            for ch in 0..channels {
+                let i = (ch * sample_size) as usize;
+                let sample = i16::from_le_bytes([frame[i], frame[i + 1]]);
+                writer.write_sample(sample)?;
+            }
+        }
+    }
+
+    writer.finalize()?;
+
+    let sound = load_sound_from_bytes(&buffer).await?;
 
     play_sound_once(&sound);
 
     for texture in frames {
         clear_background(WHITE);
-        draw_texture(&texture, 0., 0., WHITE);
+        draw_texture(&texture, 0., 0., BLACK);
         draw_text(
             &format!("{:.2}", 1. / get_frame_time()),
             90.,
@@ -180,14 +234,12 @@ async fn draw_video(
             BLACK,
         );
 
-        // let sound = load_sound_from_bytes(audio.data(0)).await?;
-
-        // play_sound_once(&sound);
-
         let elapsed = instant.elapsed();
 
         if elapsed < frame_duration {
             sleep(frame_duration - elapsed);
+        } else {
+            warn!("took tooooo long to render!");
         }
         instant = Instant::now();
         next_frame().await;

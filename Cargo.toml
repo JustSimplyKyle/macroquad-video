@@ -8,6 +8,7 @@ edition = "2024"
 [dependencies]
 eyre = "0.6.12"
 ffmpeg-the-third = "3.0.1"
+hound = "3.5.1"
 macroquad = { version = "0.4.14", features = ["audio"] }
 
 [profile.dev]
