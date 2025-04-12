@@ -60,8 +60,6 @@ fn retain_aspect_ratio_scale(frame: &Video) -> Result<Texture2D, eyre::Error> {
     eyre::Result::Ok(texture)
 }
 
-// type Frames = ;
-
 fn decode_frame<'a>(
     vpackets: Vec<&mut (Stream<'a>, Packet)>,
     apackets: Vec<&mut (Stream<'a>, Packet)>,
@@ -119,19 +117,13 @@ fn decode_frame<'a>(
             let mut decoded_audio = Audio::empty();
             let mut audio = Vec::new();
             while adecoder.receive_frame(&mut decoded_audio).is_ok() {
-                let mut resampler = ffmpeg::software::resampler2(
-                    (
-                        decoded_audio.format(),
-                        decoded_audio.ch_layout(),
-                        decoded_audio.rate(),
-                    ),
-                    (
+                let mut resampler = decoded_audio
+                    .resampler2(
                         format::Sample::I16(format::sample::Type::Packed),
                         decoded_audio.ch_layout(),
                         decoded_audio.rate(),
-                    ),
-                )
-                .ok()?;
+                    )
+                    .ok()?;
                 let mut wav = Audio::empty();
                 resampler.run(&decoded_audio, &mut wav).ok()?;
                 audio.push(wav);
@@ -178,11 +170,6 @@ async fn draw_video(
 
     let frame_duration = Duration::from_secs_f64(frame_duration);
 
-    // FIXME: ass workaround
-    // let sound = load_sound_from_bytes(&std::fs::read("output.wav")?).await?;
-
-    // play_sound_once(&sound);
-    //
     let mut buffer = Vec::new();
     let cursor = std::io::Cursor::new(&mut buffer);
 
@@ -247,7 +234,7 @@ async fn draw_video(
                 broken = broken.saturating_sub(frame_duration - elapsed);
             }
         } else {
-            broken = elapsed - frame_duration;
+            broken += elapsed - frame_duration;
             warn!(
                 "took tooooo long to render!\nwill try to compensate it by early playing the next frame by {:?}",
                 broken
