@@ -1,6 +1,7 @@
+#![feature(iter_map_windows)]
+
 use std::{
     iter,
-    ops::DerefMut,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -9,16 +10,17 @@ use eyre::ContextCompat;
 use ffmpeg_the_third::{
     self as ffmpeg, Packet, Stream, codec,
     filter::Graph,
-    format::{self, Pixel},
+    format::{self, Pixel, context::Input},
     frame::{Audio, Video},
     media,
     software::scaling::Flags,
     threading,
 };
 use macroquad::{
-    audio::{load_sound_from_bytes, play_sound_once},
+    audio::{Sound, load_sound_from_bytes, play_sound_once},
     prelude::*,
 };
+
 fn retain_aspect_ratio_scale(frame: &Video) -> Result<Texture2D, eyre::Error> {
     let src_width = frame.width();
     let src_height = frame.height();
@@ -61,12 +63,12 @@ fn retain_aspect_ratio_scale(frame: &Video) -> Result<Texture2D, eyre::Error> {
     eyre::Result::Ok(texture)
 }
 
-fn decode_frame<'a>(
-    video_packets: Vec<&mut (Stream<'a>, Packet)>,
-    audio_packets: Vec<&mut (Stream<'a>, Packet)>,
+fn decode_frame<'a, T: Iterator<Item = (Stream<'a>, Packet)>>(
+    video_packets: Vec<(Stream<'a>, Packet)>,
+    audio_packets: T,
 ) -> eyre::Result<(
-    impl Iterator<Item = Texture2D>,
-    impl Iterator<Item = Audio>,
+    impl Iterator<Item = Texture2D> + use<'a, T>,
+    impl Iterator<Item = Audio> + use<'a, T>,
     f64,
 )> {
     let (avg_frame_rate, vstream) = video_packets
@@ -74,8 +76,9 @@ fn decode_frame<'a>(
         .map(|x| (x.0.avg_frame_rate().into(), x.0.parameters()))
         .context("not possible")?;
 
+    let mut audio_packets = audio_packets.peekable();
     let astream = audio_packets
-        .first()
+        .peek()
         .map(|x| x.0.parameters())
         .context("not possible")?;
 
@@ -101,18 +104,15 @@ fn decode_frame<'a>(
         Flags::BILINEAR,
     )?;
 
-    let boxed_empty = Box::new(Packet::empty());
-
     let audio = audio_packets
-        .into_iter()
-        .map(|x| &x.1)
-        .chain(std::iter::once(&*Box::leak(boxed_empty.clone())))
+        .map(|x| x.1)
+        .chain(std::iter::once(Packet::empty()))
         .filter_map(move |packet| {
             unsafe {
                 if packet.is_empty() {
                     adecoder.send_eof().ok()?;
                 } else {
-                    adecoder.send_packet(packet).ok()?;
+                    adecoder.send_packet(&packet).ok()?;
                 }
             }
             let mut decoded_audio = Audio::empty();
@@ -135,14 +135,14 @@ fn decode_frame<'a>(
 
     let video = video_packets
         .into_iter()
-        .map(|x| &x.1)
-        .chain(std::iter::once(&*Box::leak(boxed_empty)))
+        .map(|x| x.1)
+        .chain(std::iter::once(Packet::empty()))
         .filter_map(move |packet| {
             unsafe {
                 if packet.is_empty() {
                     vdecoder.send_eof().ok()?;
                 } else {
-                    vdecoder.send_packet(packet).ok()?;
+                    vdecoder.send_packet(&packet).ok()?;
                 }
             }
             let mut decoded_video = Video::empty();
@@ -161,63 +161,113 @@ fn decode_frame<'a>(
     Ok((video, audio, avg_frame_rate))
 }
 
-async fn draw_video(
-    frames: impl Iterator<Item = Texture2D>,
-    audio: impl Iterator<Item = Audio>,
+struct VideoPlayer<Iter: iter::Iterator<Item = Texture2D>> {
+    frames: iter::Peekable<Iter>,
+    frames_played: usize,
     frame_rate: f64,
-) -> eyre::Result<()> {
-    let frame_duration = 1.0 / frame_rate;
-    let audio = audio.peekable();
+    audio: Sound,
+    instant: Instant,
+    broken: Duration,
+}
 
-    let frame_duration = Duration::from_secs_f64(frame_duration);
+impl<Iter: Iterator<Item = Texture2D>> VideoPlayer<Iter> {
+    fn frame_limiter(&mut self) {
+        let frame_duration = Duration::from_secs_f64(1. / self.frame_rate);
+        let elapsed = self.instant.elapsed();
 
-    let buffer = build_wav_from_raw(audio)?;
+        if elapsed < frame_duration {
+            if frame_duration - elapsed >= self.broken {
+                sleep(frame_duration - elapsed - self.broken);
+                self.broken = Duration::ZERO;
+            } else {
+                sleep(Duration::ZERO);
+                self.broken = self.broken.saturating_sub(frame_duration - elapsed);
+            }
+        } else {
+            if self.broken > Duration::from_millis(1000) {
+                error!(
+                    "compensation frames exceed 1000ms in total, please make sure settings are correct!"
+                );
+            }
+            self.broken += elapsed - frame_duration;
+            warn!(
+                "took tooooo long to render!\nwill try to compensate it by early playing the few next frames by {:?}",
+                self.broken
+            );
+        }
+        self.instant = Instant::now();
+    }
 
-    let sound = load_sound_from_bytes(&buffer).await?;
-
-    play_sound_once(&sound);
-
-    let mut broken = Duration::new(0, 0);
-
-    let mut instant = Instant::now();
-
-    for texture in frames {
+    fn draw_video_by_frame(&mut self) {
         clear_background(BLACK);
-        draw_texture(&texture, 0., 0., WHITE);
+
+        if self.frames_played == 0 {
+            play_sound_once(&self.audio);
+        }
+
+        let Some(texture) = &self.frames.next() else {
+            return;
+        };
+
+        draw_texture(texture, 0., 0., WHITE);
+        let text_color = WHITE;
+
         draw_text(
             &format!("{:.2}", 1. / get_frame_time()),
             90.,
             90.,
             70.,
-            BLACK,
+            text_color,
         );
 
-        let elapsed = instant.elapsed();
+        self.frame_limiter();
 
-        if elapsed < frame_duration {
-            if frame_duration - elapsed >= broken {
-                sleep(frame_duration - elapsed - broken);
-                broken = Duration::ZERO;
-            } else {
-                sleep(Duration::ZERO);
-                broken = broken.saturating_sub(frame_duration - elapsed);
-            }
-        } else {
-            if broken > Duration::from_millis(1000) {
-                error!(
-                    "compensation frames exceed 1000ms in total, please make sure settings are correct!"
-                );
-            }
-            broken += elapsed - frame_duration;
-            warn!(
-                "took tooooo long to render!\nwill try to compensate it by early playing the few next frames by {:?}",
-                broken
-            );
-        }
-        instant = Instant::now();
-        next_frame().await;
+        self.frames_played += 1;
     }
-    Ok(())
+}
+
+async fn get_video_player(
+    input: &mut Input,
+) -> eyre::Result<VideoPlayer<impl Iterator<Item = Texture2D>>> {
+    let vstream_id = input
+        .streams()
+        .best(media::Type::Video)
+        .context("stream not found")?
+        .index();
+
+    let astream_id = input
+        .streams()
+        .best(media::Type::Audio)
+        .context("stream not found")?
+        .index();
+
+    let packets = input.packets().filter_map(Result::ok);
+
+    let (video_packets, not_video_packets): (Vec<_>, Vec<_>) =
+        packets.partition(|x| x.0.index() == vstream_id);
+
+    let audio_packets = not_video_packets
+        .into_iter()
+        .filter(move |x| x.0.index() == astream_id);
+
+    let (frames, audio, frame_rate) = decode_frame(video_packets, audio_packets)?;
+
+    let audio = audio.peekable();
+
+    let buffer = build_wav_from_raw(audio)?;
+
+    let sound = load_sound_from_bytes(&buffer).await?;
+
+    let video_player = VideoPlayer {
+        frames: frames.peekable(),
+        frames_played: 0,
+        frame_rate,
+        audio: sound,
+        instant: Instant::now(),
+        broken: Duration::ZERO,
+    };
+
+    Ok(video_player)
 }
 
 fn build_wav_from_raw(
@@ -225,27 +275,27 @@ fn build_wav_from_raw(
 ) -> Result<Vec<u8>, eyre::Error> {
     let mut buffer = Vec::new();
     let cursor = std::io::Cursor::new(&mut buffer);
+
+    let first = audio.peek().context("empty audio stream")?;
+
+    let channels = first.ch_layout().channels();
+
     let mut writer = hound::WavWriter::new(
         cursor,
         hound::WavSpec {
-            channels: audio
-                .peek()
-                .context("empty audio stream")?
-                .ch_layout()
-                .channels()
-                .try_into()?,
-            sample_rate: audio.peek().context("empty audio stream")?.rate(),
+            channels: channels.try_into()?,
+            sample_rate: first.rate(),
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         },
     )?;
+
     for audio in audio {
-        let channels: u16 = audio.ch_layout().channels().try_into()?;
         let data = audio.data(0);
         let sample_size = 2;
         let frame_size = sample_size * channels;
 
-        for frame in data.chunks_exact(frame_size.into()) {
+        for frame in data.chunks_exact(frame_size.try_into()?) {
             for ch in 0..channels {
                 let i = (ch * sample_size) as usize;
                 let sample = i16::from_le_bytes([frame[i], frame[i + 1]]);
@@ -260,38 +310,13 @@ fn build_wav_from_raw(
 #[macroquad::main("MyGame")]
 async fn main() -> eyre::Result<()> {
     ffmpeg::init()?;
-
-    request_new_screen_size(800., 450.);
-    let mut input = ffmpeg::format::input("song.webm")?;
-    let vstream_id = input
-        .streams()
-        .best(media::Type::Video)
-        .context("stream not found")?
-        .index();
-    let astream_id = input
-        .streams()
-        .best(media::Type::Audio)
-        .context("stream not found")?
-        .index();
-    let mut packets = input.packets().filter_map(Result::ok).collect::<Vec<_>>();
-
-    let (video_packets, mut not_video_packets): (Vec<_>, Vec<_>) =
-        packets.iter_mut().partition(|x| x.0.index() == vstream_id);
-
-    let audio_packets = not_video_packets
-        .iter_mut()
-        .filter(|x| x.0.index() == astream_id)
-        .map(DerefMut::deref_mut)
-        .collect::<Vec<_>>();
-
-    let (frames, audio, frame_rate) = decode_frame(video_packets, audio_packets)?;
-
     rand::srand(miniquad::date::now().to_bits());
 
-    draw_video(frames, audio, frame_rate).await?;
+    let mut input = ffmpeg::format::input("prodigy.webm")?;
+    let mut video_player = get_video_player(&mut input).await?;
 
     loop {
-        clear_background(RED);
+        video_player.draw_video_by_frame();
         next_frame().await;
     }
 }
